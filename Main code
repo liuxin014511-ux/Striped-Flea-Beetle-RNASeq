@@ -1,0 +1,340 @@
+# ==============================================================================
+# Transcriptome Downstream Analysis Pipeline
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Environment Preparation & Package Loading
+# ------------------------------------------------------------------------------
+# Check and install missing packages dynamically
+required_packages <- c("dplyr", "tidyr", "matrixStats", "ggplot2", "patchwork", 
+                       "pheatmap", "circlize", "RColorBrewer")
+bioc_packages <- c("ComplexHeatmap", "EnhancedVolcano")
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+}
+for (pkg in bioc_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+    BiocManager::install(pkg, update = FALSE)
+  }
+}
+
+library(dplyr)
+library(tidyr)
+library(matrixStats)
+library(ggplot2)
+library(patchwork)
+library(pheatmap)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+library(EnhancedVolcano)
+
+# [Customizable] Set working directory
+# setwd("path/to/your/working_directory")
+
+# ------------------------------------------------------------------------------
+# 2. Data Loading, Validation & Automatic Group Parsing
+# ------------------------------------------------------------------------------
+# Read TPM expression matrix and metadata
+expr_tpm <- read.csv("gene_tpm_matrix.csv", row.names = 1, check.names = FALSE)
+meta_data <- read.csv("all_samples_metadata.csv", stringsAsFactors = FALSE)
+
+# Ensure correct metadata format
+if (!all(c("id", "group") %in% colnames(meta_data))) {
+  stop("Metadata must contain both 'id' and 'group' columns!")
+}
+
+# Extract intersecting samples to prevent matrix and metadata mismatch
+common_samples <- intersect(colnames(expr_tpm), meta_data$id)
+expr_tpm <- expr_tpm[, common_samples, drop = FALSE]
+meta_data <- meta_data[meta_data$id %in% common_samples, ]
+
+# Automatically generate group -> sample ID mapping
+groups_auto <- meta_data %>%
+  group_by(group) %>%
+  summarise(samples = list(id), .groups = "drop") %>%
+  tibble::deframe()
+
+cat("Detected Groups:", paste(names(groups_auto), collapse = ", "), "\n")
+
+# ------------------------------------------------------------------------------
+# 3. Core: Stage-specific Gene Filtering
+# ------------------------------------------------------------------------------
+# 3.1 Calculate mean TPM for each group
+group_means_df <- sapply(names(groups_auto), function(group) {
+  rowMeans(expr_tpm[, groups_auto[[group]], drop = FALSE], na.rm = TRUE)
+}) %>% as.data.frame()
+
+rownames(group_means_df) <- rownames(expr_tpm)
+expr_means <- group_means_df # Backup for downstream calculations
+
+# 3.2 Specific gene filtering rules
+# Rule 1: Target stage mean TPM >= 1
+# Rule 2: Maximum TPM of all other stages <= 0.5
+# Rule 3: Target group mean TPM / Maximum of other groups >= 5 (Fold Change)
+thresholds <- list(
+  min_target_tpm = 1,
+  max_other_tpm = 0.5,
+  fold_change = 5
+)
+
+specific_genes_list <- list()
+
+for (target_group in names(groups_auto)) {
+  target_mean <- expr_means[, target_group]
+  other_groups <- setdiff(names(groups_auto), target_group)
+  other_means <- expr_means[, other_groups, drop = FALSE]
+  other_max <- apply(other_means, 1, max)
+  
+  # Calculate fold change (add 0.01 to denominator to avoid division by zero)
+  fc <- target_mean / (other_max + 0.01)
+  
+  # Logical filtering
+  is_specific <- (target_mean >= thresholds$min_target_tpm) & 
+    (other_max <= thresholds$max_other_tpm) & 
+    (fc >= thresholds$fold_change)
+  
+  specific_df <- expr_means[is_specific, , drop = FALSE] %>%
+    mutate(
+      gene_id = rownames(.),
+      Specific_Stage = target_group,
+      Target_Mean_TPM = target_mean[is_specific],
+      Other_Max_TPM = other_max[is_specific],
+      Fold_Change = fc[is_specific],
+      .before = 1
+    )
+  
+  specific_genes_list[[target_group]] <- specific_df
+  write.csv(specific_df, file = paste0(target_group, "_FC_strict_stage_specific_genes.csv"), row.names = FALSE)
+}
+
+# Summarize and save all stage-specific genes
+all_specific_genes_df <- bind_rows(specific_genes_list)
+write.csv(all_specific_genes_df, "All_Stage_Specific_Genes_Summary.csv", row.names = FALSE)
+cat("Stage-specific gene filtering complete!\n")
+
+# ------------------------------------------------------------------------------
+# 4. ComplexHeatmap Visualization for Specific Genes
+# ------------------------------------------------------------------------------
+# Retrieve filtered specific gene IDs
+specific_gene_ids <- all_specific_genes_df$gene_id
+
+if (length(specific_gene_ids) > 1) {
+  # Extract expression matrix for specific genes and apply Log2 transformation
+  heatmap_data <- expr_tpm[specific_gene_ids, ]
+  heatmap_data_log <- log2(heatmap_data + 1)
+  
+  # Z-score standardization (Row-wise)
+  heatmap_data_scaled <- t(scale(t(heatmap_data_log)))
+  
+  # Prepare column annotations (Developmental stages)
+  col_anno <- HeatmapAnnotation(
+    Stage = meta_data$group,
+    col = list(Stage = setNames(brewer.pal(length(names(groups_auto)), "Set1"), names(groups_auto)))
+  )
+  
+  # Generate and save Heatmap to PDF
+  # Clustering algorithm confirmed: Euclidean distance + Complete linkage
+  pdf("Stage_Specific_Genes_ComplexHeatmap.pdf", width = 8, height = 10)
+  ht <- Heatmap(
+    heatmap_data_scaled,
+    name = "Z-score",
+    col = colorRamp2(c(-2, 0, 2), c("blue", "white", "red")),
+    show_row_names = FALSE,
+    show_column_names = TRUE,
+    top_annotation = col_anno,
+    cluster_rows = TRUE,
+    clustering_distance_rows = "euclidean",
+    clustering_method_rows = "complete",        
+    cluster_columns = TRUE,
+    clustering_distance_columns = "euclidean",
+    clustering_method_columns = "complete",     
+    column_title = "Hierarchical Clustering of Stage-Specific Genes"
+  )
+  draw(ht)
+  dev.off()
+  cat("ComplexHeatmap generated and saved to 'Stage_Specific_Genes_ComplexHeatmap.pdf'.\n")
+} else {
+  warning("Not enough stage-specific genes found to plot a heatmap.")
+}
+
+# ------------------------------------------------------------------------------
+# 5. Principal Component Analysis (PCA) & ggplot2 Visualization
+# ------------------------------------------------------------------------------
+# Data transformation: Log2 processing for PCA input
+pca_input <- t(log2(expr_tpm + 1))
+
+# Filter genes with zero variance to prevent prcomp errors
+pca_input <- pca_input[, apply(pca_input, 2, var) > 0]
+
+# Perform PCA
+pca_res <- prcomp(pca_input, scale. = TRUE)
+
+# Calculate variance explained by principal components
+pca_importance <- summary(pca_res)$importance
+pc1_var <- round(pca_importance[2, 1] * 100, 2)
+pc2_var <- round(pca_importance[2, 2] * 100, 2)
+
+# Merge metadata for plotting
+pca_df <- as.data.frame(pca_res$x) %>%
+  mutate(id = rownames(.)) %>%
+  left_join(meta_data, by = "id")
+
+# Generate PCA plot using ggplot2
+pca_plot <- ggplot(pca_df, aes(x = PC1, y = PC2, color = group)) +
+  geom_point(size = 4, alpha = 0.8) +
+  theme_bw() +
+  labs(
+    title = "Principal Component Analysis (PCA)",
+    x = paste0("PC1 (", pc1_var, "% Variance)"),
+    y = paste0("PC2 (", pc2_var, "% Variance)"),
+    color = "Developmental Stage"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )
+
+ggsave("Sample_PCA_Plot.pdf", plot = pca_plot, width = 7, height = 5)
+cat("PCA analysis complete. Plot saved to 'Sample_PCA_Plot.pdf'.\n")
+
+# ------------------------------------------------------------------------------
+# 6. Pairwise Differential Expression & Custom Volcano Plots (Patchwork)
+# ------------------------------------------------------------------------------
+# Customized individual volcano plot function
+custom_volcano_plot <- function(data, title_text, log2fc_cut = 1, padj_cut = 0.05) {
+  data$significance <- "not differential expressed"
+  data$significance[data$log2FoldChange > log2fc_cut & data$padj < padj_cut] <- "up-regulated"
+  data$significance[data$log2FoldChange < -log2fc_cut & data$padj < padj_cut] <- "down-regulated"
+  
+  counts <- table(data$significance)
+  label_ns <- paste0("not differential expressed (", ifelse(is.na(counts["not differential expressed"]), 0, counts["not differential expressed"]), ")")
+  label_up <- paste0("up-regulated (", ifelse(is.na(counts["up-regulated"]), 0, counts["up-regulated"]), ")")
+  label_down <- paste0("down-regulated (", ifelse(is.na(counts["down-regulated"]), 0, counts["down-regulated"]), ")")
+  
+  data$significance <- factor(data$significance, levels = c("not differential expressed", "up-regulated", "down-regulated"))
+  
+  my_colors <- c("not differential expressed" = "#C0C0C0", "up-regulated" = "#ED7D31", "down-regulated" = "#5B9BD5")
+  my_labels <- c("not differential expressed" = label_ns, "up-regulated" = label_up, "down-regulated" = label_down)
+  
+  p <- ggplot(data, aes(x = log2FoldChange, y = -log10(padj))) +
+    geom_point(aes(color = significance), shape = 4, size = 0.8, stroke = 0.3, alpha = 0.8) +
+    scale_color_manual(values = my_colors, labels = my_labels, name = NULL) +
+    geom_vline(xintercept = c(-log2fc_cut, log2fc_cut), linetype = "dashed", color = "#70AD47", linewidth = 0.4) +
+    geom_hline(yintercept = -log10(padj_cut), linetype = "dashed", color = "#70AD47", linewidth = 0.4) +
+    labs(title = title_text) +
+    xlab(bquote(Log[2] ~ "Fold Change")) +
+    ylab(bquote(-Log[10] ~ "(Adjusted P-value)")) +
+    coord_cartesian(ylim = c(0, 4)) +
+    theme_bw() +
+    theme(
+      panel.grid.major = element_line(color = "grey85"),
+      panel.grid.minor = element_blank(),
+      legend.position = "top",
+      legend.justification = "right",
+      legend.text = element_text(size = 8),
+      legend.key.size = unit(0.2, "cm"),
+      legend.margin = margin(0, 0, 0, 0),
+      plot.title = element_text(size = 10, hjust = 0),
+      axis.title = element_text(size = 9),
+      axis.text = element_text(size = 8)
+    )
+  return(p)
+}
+
+group_names <- names(groups_auto)
+plot_list <- list()
+
+if (length(group_names) >= 2) {
+  combinations <- combn(group_names, 2, simplify = FALSE)
+  for (i in seq_along(combinations)) {
+    combo <- combinations[[i]]
+    group_A <- combo[1]
+    group_B <- combo[2]
+    comparison_name <- paste0(group_A, "_vs_", group_B)
+    
+    samples_A <- groups_auto[[group_A]]
+    samples_B <- groups_auto[[group_B]]
+    
+    # Calculate Mean and Log2FC
+    mean_A <- rowMeans(expr_tpm[, samples_A, drop = FALSE]) + 0.01
+    mean_B <- rowMeans(expr_tpm[, samples_B, drop = FALSE]) + 0.01
+    log2FC <- log2(mean_A / mean_B)
+    
+    # Perform two-sample T-test
+    pvalues <- apply(expr_tpm, 1, function(x) {
+      val_A <- x[match(samples_A, colnames(expr_tpm))]
+      val_B <- x[match(samples_B, colnames(expr_tpm))]
+      if (var(val_A) == 0 && var(val_B) == 0) return(1)
+      obj <- try(t.test(val_A, val_B), silent = TRUE)
+      if (is(obj, "try-error")) return(1) else return(obj$p.value)
+    })
+    
+    # Construct results dataframe
+    plot_data <- data.frame(
+      gene = rownames(expr_tpm),
+      log2FoldChange = log2FC,
+      padj = p.adjust(pvalues, method = "BH"),
+      stringsAsFactors = FALSE
+    )
+    plot_data <- na.omit(plot_data)
+    
+    # Save DEG results to CSV
+    write.csv(plot_data, paste0("DEG_Result_", comparison_name, ".csv"), row.names = FALSE)
+    
+    # Generate individual volcano plot
+    plot_title <- paste0(LETTERS[i], ". Volcano plot for ", group_A, " vs ", group_B)
+    p <- custom_volcano_plot(plot_data, title_text = plot_title, log2fc_cut = 1, padj_cut = 0.05)
+    ggsave(paste0("Volcano_Style2_", comparison_name, ".pdf"), p, width = 5, height = 5)
+    
+    plot_list[[i]] <- p
+  }
+  
+  # Combine multiple volcano plots via Patchwork
+  if (length(plot_list) > 0) {
+    combined_plot <- wrap_plots(plot_list, ncol = 3)
+    ggsave("All_Volcano_Combined.pdf", combined_plot, width = 15, height = 10)
+    ggsave("All_Volcano_Combined.png", combined_plot, width = 15, height = 10, dpi = 300)
+    cat("Combined volcano plots saved successfully!\n")
+  }
+} else {
+  warning("Insufficient groups for pairwise volcano analysis.")
+}
+
+# ------------------------------------------------------------------------------
+# 7. Sample Correlation Analysis & Pheatmap (Pearson)
+# ------------------------------------------------------------------------------
+# Filter out non-expressed genes and apply Log2 transformation
+cor_input <- expr_tpm[rowSums(expr_tpm) > 0, ]
+cor_input_log <- log2(cor_input + 1)
+
+# Calculate Pearson correlation coefficients
+cor_matrix <- cor(cor_input_log, method = "pearson")
+
+# Prepare column annotations for developmental stages
+annotation_col <- data.frame(Stage = factor(meta_data$group))
+rownames(annotation_col) <- meta_data$id
+
+# Generate and save Pearson correlation heatmap
+pdf("Sample_Correlation_Heatmap.pdf", width = 8, height = 7)
+pheatmap(cor_matrix,
+         main = "Sample Correlation Heatmap (Pearson)",
+         annotation_col = annotation_col,
+         display_numbers = TRUE,
+         number_format = "%.3f",
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+         cluster_rows = TRUE,
+         clustering_distance_rows = "euclidean",
+         clustering_method_rows = "complete",   
+         cluster_cols = TRUE,
+         clustering_distance_cols = "euclidean",
+         clustering_method_cols = "complete",
+         fontsize = 10,
+         fontsize_number = 8,
+         border_color = "grey"
+)
+dev.off()
+cat("Sample correlation analysis complete. Heatmap saved.\n")
+cat("=== ALL ANALYSES COMPLETED SUCCESSFULLY ===\n")
