@@ -1,4 +1,4 @@
-# Striped-Flea-Beetle-UVB-RNASeq
+# Striped-Flea-Beetle-RNASeq
 Screening for specific gene
 Transcriptome Analysis Pipeline for Developmental Stages
 Introduction
